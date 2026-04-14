@@ -23,6 +23,18 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type distributorCandidateSnapshot struct {
+	ChannelID      int    `json:"channel_id"`
+	ChannelName    string `json:"channel_name"`
+	ChannelStatus  int    `json:"channel_status"`
+	AbilityEnabled bool   `json:"ability_enabled"`
+	Priority       int64  `json:"priority"`
+	Weight         uint   `json:"weight"`
+	Tag            string `json:"tag,omitempty"`
+	Group          string `json:"group"`
+	Model          string `json:"model"`
+}
+
 type ModelRequest struct {
 	Model string `json:"model"`
 	Group string `json:"group,omitempty"`
@@ -150,6 +162,7 @@ func Distribute() func(c *gin.Context) {
 							showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 						}
 						message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": showGroup, "Model": modelRequest.Model, "Error": err.Error()})
+						logDistributorSelectionFailure(c, modelRequest.Model, showGroup, "get_channel_failed", message, http.StatusServiceUnavailable)
 						// 如果错误，但是渠道不为空，说明是数据库一致性问题
 						//if channel != nil {
 						//	common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
@@ -159,6 +172,7 @@ func Distribute() func(c *gin.Context) {
 						return
 					}
 					if channel == nil {
+						logDistributorSelectionFailure(c, modelRequest.Model, usingGroup, "no_available_channel", i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), http.StatusServiceUnavailable)
 						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
 						return
 					}
@@ -541,6 +555,109 @@ func logDistributorChannelDecision(
 			channelStatus,
 			usingGroup,
 			c.Request.URL.Path,
+		),
+	)
+}
+
+func loadDistributorCandidateSnapshots(group string, modelName string) []distributorCandidateSnapshot {
+	models := []string{modelName}
+	if normalized := ratio_setting.FormatMatchingModelName(modelName); normalized != "" && normalized != modelName {
+		models = append(models, normalized)
+	}
+
+	var abilities []model.Ability
+	err := model.DB.Where(model.Ability{Group: group}).
+		Where("model IN ?", models).
+		Order("priority DESC, weight DESC, channel_id ASC").
+		Find(&abilities).Error
+	if err != nil {
+		common.SysError(fmt.Sprintf("load distributor candidate snapshots failed: group=%s model=%s err=%v", group, modelName, err))
+		return nil
+	}
+
+	if len(abilities) == 0 {
+		return nil
+	}
+
+	channelIDs := make([]int, 0, len(abilities))
+	channelMap := make(map[int]*model.Channel, len(abilities))
+	for _, ability := range abilities {
+		channelIDs = append(channelIDs, ability.ChannelId)
+	}
+
+	var channels []*model.Channel
+	if err = model.DB.Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+		common.SysError(fmt.Sprintf("load distributor candidate channels failed: group=%s model=%s err=%v", group, modelName, err))
+		return nil
+	}
+	for _, channel := range channels {
+		channelMap[channel.Id] = channel
+	}
+
+	result := make([]distributorCandidateSnapshot, 0, len(abilities))
+	for _, ability := range abilities {
+		channel := channelMap[ability.ChannelId]
+		snapshot := distributorCandidateSnapshot{
+			ChannelID:      ability.ChannelId,
+			AbilityEnabled: ability.Enabled,
+			Group:          ability.Group,
+			Model:          ability.Model,
+			Weight:         ability.Weight,
+		}
+		if ability.Priority != nil {
+			snapshot.Priority = *ability.Priority
+		}
+		if ability.Tag != nil {
+			snapshot.Tag = *ability.Tag
+		}
+		if channel != nil {
+			snapshot.ChannelName = channel.Name
+			snapshot.ChannelStatus = channel.Status
+		} else {
+			snapshot.ChannelName = "missing"
+			snapshot.ChannelStatus = -1
+		}
+		result = append(result, snapshot)
+	}
+	return result
+}
+
+func logDistributorSelectionFailure(c *gin.Context, modelName string, usingGroup string, decisionReason string, message string, statusCode int) {
+	candidates := loadDistributorCandidateSnapshots(usingGroup, modelName)
+	other := map[string]interface{}{
+		"event":           "request_failed",
+		"decision_reason": decisionReason,
+		"status_code":     statusCode,
+		"request_path":    c.Request.URL.Path,
+		"using_group":     usingGroup,
+		"candidates":      candidates,
+	}
+
+	if constant.ErrorLogEnabled {
+		model.RecordErrorLog(
+			c,
+			c.GetInt("id"),
+			0,
+			modelName,
+			c.GetString("token_name"),
+			message,
+			c.GetInt("token_id"),
+			0,
+			false,
+			usingGroup,
+			other,
+		)
+	}
+
+	logger.LogError(
+		c.Request.Context(),
+		fmt.Sprintf(
+			"event=request_failed status=channel_selection_failed decision_reason=%s model=%s using_group=%s request_path=%s candidates=%v",
+			decisionReason,
+			modelName,
+			usingGroup,
+			c.Request.URL.Path,
+			candidates,
 		),
 	)
 }
